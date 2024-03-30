@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"sync"
 
@@ -23,17 +22,16 @@ var (
 		},
 	}
 
-	clients   = map[uint64]*Client{}
+	clients   = map[string]*Client{}
 	broadcast = make(chan []byte)
-	usernames = map[string]bool{}
 	lock      = sync.RWMutex{}
+	nAnon     = 0
 )
 
 type Client struct {
 	conn      *websocket.Conn
 	send      chan []byte
 	username  string
-	id        uint64
 	broadcast chan []byte
 }
 
@@ -42,9 +40,8 @@ func (c *Client) sendMessages() {
 		lock.Lock()
 		defer lock.Unlock()
 
-		delete(clients, c.id)
+		delete(clients, c.username)
 		c.conn.Close()
-		delete(usernames, c.username)
 	}()
 
 	for {
@@ -71,6 +68,7 @@ func (c *Client) receiveMessages() {
 
 		w, err := c.conn.NextWriter(websocket.TextMessage)
 		if err != nil {
+			log.Printf("Error while getting next writer for %s: %v\nClosing connection...", c.username, err)
 			return
 		}
 		w.Write(message)
@@ -97,10 +95,18 @@ func getAndValidateUsername(h http.Header) (string, error) {
 		return "", common.ErrInvalidUsername
 	}
 
-	lock.RLock()
-	defer lock.RUnlock()
 	un := usernameHeader[0]
-	if _, exists = usernames[un]; un != "anonymous" && exists {
+	if un == "anonymous" {
+		lock.Lock()
+		un = fmt.Sprintf("anonymous%d", nAnon)
+		nAnon++
+		lock.Unlock()
+	}
+
+	lock.RLock()
+	_, exists = clients[un]
+	lock.RUnlock()
+	if exists {
 		log.Println("Username already exists, closing connection...")
 		return "", common.ErrUsernameExists
 	}
@@ -121,22 +127,13 @@ func acceptConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lock.Lock()
-	defer lock.Unlock()
-	id := rand.Uint64()
-	for _, exists := clients[id]; exists; {
-		id = rand.Uint64()
-	}
-
 	client := &Client{
 		conn:      conn,
 		send:      make(chan []byte, 256),
 		username:  username,
-		id:        id,
 		broadcast: broadcast,
 	}
-	clients[id] = client
-	usernames[username] = true
+	clients[username] = client
 	go client.receiveMessages()
 	go client.sendMessages()
 }
@@ -152,7 +149,6 @@ func broadcastMessages() {
 				close(client.send)
 				lock.Lock()
 				delete(clients, id)
-				delete(usernames, client.username)
 				lock.Unlock()
 			}
 		}
